@@ -1,0 +1,163 @@
+## Spark Application - MapReduce Programming
+
+try:
+    from pyspark import SparkConf, SparkContext
+except:
+    print
+    "No spark libraries found, ensure you are running locally."
+
+import sys
+
+# Global variables.
+userDict_ = {}
+
+def main_spark(sc, outputFileAddress, inputFileName, top_n):
+    # load the original file from HDFS
+    records = sc.textFile(inputFileName)
+    header = records.first()
+    records = records.filter(lambda a: a != header)
+
+    # reduceByKey: collect all users like or dislike one movie
+    # reduceByKey: return (movie, [(tag, [user])])
+    # map: return [(tag, user1, user2)]
+    allUserInfo = records.map(userPreference) \
+        .reduceByKey(lambda a, b: a + b) \
+        .map(lambda a: (a[0][0], [(a[0][1], a[1])])) \
+        .reduceByKey(lambda a, b: a + b)\
+        .map(makeUserPair) \
+        .reduce(lambda a, b: a + b)
+  
+    
+    # make rdd
+    # map-reduce: add all kinds of userpair number, return ((tag, user1, user2), number)
+    # map: (tag, (user1, user2, number))
+    userPairRecord = sc.parallelize(allUserInfo)\
+        .map(lambda a: (a, 1))\
+        .reduceByKey(lambda a, b: a+b)\
+        .map(lambda a: (a[0][0], (a[0][1], a[0][2], a[1])))
+    
+    # get all users' movie ranked number, make dict
+    singleUser = userPairRecord\
+        .filter(lambda a: a[0] == 3)\
+        .map(lambda a: {a[1][0]: a[1][2]})\
+        .collect()
+    userDict = {}
+    for user in singleUser:
+        userDict.update(user)
+    
+    # broadcast userDict
+    global userDict_
+    userDict_ = sc.broadcast(userDict)
+   
+    # map-reduce: collect all info of same userpair, return ((user1, user2), [(tag, number)])
+    # map: return (jaccardValue, (user1, user2))
+    # sort by jaccard similar value
+    jaccardSim = userPairRecord.filter(lambda a: a[0] != 3) \
+        .map(lambda a: ((a[1][0], a[1][1]), [(a[0], a[1][2])])) \
+        .reduceByKey(lambda a, b: a+b) \
+        .map(jaccard) \
+        .sortByKey(False) \
+        .map(lambda a: (str(a[1][0]), str(a[1][1]), str(a[0]))) \
+        .take(int(top_n))
+
+    fp = open(outputFileAddress, "wb")
+    for pairs in jaccardSim:
+        toStr = " ".join(pairs)
+        fp.writelines(toStr)
+        fp.write("\n")
+    fp.close()
+    
+    print("Done successfully!")
+
+
+def userPreference(record):
+    # split each line, extract userId, movieId and rating
+    userId = int(record.split(",")[0])
+    movieId = record.split(",")[1].encode('ascii')
+    rating = float(record.split(",")[2])
+
+    # prepocess datasets
+    if 0.5 <= rating <= 2.5:
+        tag = 0
+    elif 2.5 < rating <= 5:
+        tag = 1
+    else:
+        print("wrong rating!")
+
+    return ((movieId, tag),[userId])
+
+
+def makeUserPair(record):
+    #(movie, [(tag, [user])])
+    # ensure small user id first and bigger user id second
+    likeGroup = []
+    dislikeGroup = []
+    userPairList = []
+    for group in record[1]:
+        if group[0] == 0:
+            dislikeGroup = group[1]
+        else:
+            likeGroup = group[1]
+    # both like one movie, tag 0
+    for i in range(len(likeGroup)):
+        for j in range(i+1, len(likeGroup)):
+            if likeGroup[i] < likeGroup[j]:
+                userPairList.append((0, likeGroup[i], likeGroup[j]))
+            else:
+                userPairList.append((0, likeGroup[j], likeGroup[i]))
+    # both dislike one movie, tag 1
+    for i in range(len(dislikeGroup)):
+        for j in range(i+1, len(dislikeGroup)):
+            if dislikeGroup[i] < dislikeGroup[j]:
+                userPairList.append((1, dislikeGroup[i], dislikeGroup[j]))
+            else:
+                userPairList.append((1, dislikeGroup[j], dislikeGroup[i]))
+    # one like it and the other dislike it, tag 2
+    for i in range(len(likeGroup)):
+        for j in range(len(dislikeGroup)):
+            if likeGroup[i] < dislikeGroup[j]:
+                userPairList.append((2, likeGroup[i], dislikeGroup[j]))
+            else:
+                userPairList.append((2, dislikeGroup[j], likeGroup[i]))
+    # user like & user dislike, tag 3
+    for i in range(len(likeGroup)):
+        userPairList.append((3, likeGroup[i], likeGroup[i]))
+    for i in range(len(dislikeGroup)):
+        userPairList.append((3, dislikeGroup[i], dislikeGroup[i]))
+    return userPairList
+
+
+def jaccard(record):
+    #((user1, user2), [(tag, number)])
+    bothlike = 0
+    bothdislike = 0
+    onelike = 0
+    for userpairInfo in record[1]:
+        if userpairInfo[0] == 0:
+            bothlike = userpairInfo[1]
+        elif userpairInfo[0] == 1:
+            bothdislike = userpairInfo[1]
+        elif userpairInfo[0] == 2:
+            onelike = userpairInfo[1]
+    user1AllMovies = userDict_.value[record[0][0]]
+    user2AllMovies = userDict_.value[record[0][1]]
+    
+    jaccardValue = float(bothlike + bothdislike) / (user1AllMovies + user2AllMovies - bothlike - bothdislike - onelike)
+    return (round(jaccardValue, 2), (record[0][0], record[0][1]))
+
+
+if __name__ == "__main__":
+
+    if len(sys.argv) < 3:
+        print("Error: the number of arguments should be two, the outputAddress and the inputFile ")
+        quit()
+
+    outputFileAddress = sys.argv[1]  ## the address of the local output file to create
+    inputFileName = sys.argv[2]  ## the input file in HDFS
+    top_n = sys.argv[3]
+
+    # Execute Main functionality
+    conf = SparkConf().setAppName("Top_N_Similarity")
+    sc = SparkContext(conf=conf)
+    main_spark(sc, outputFileAddress, inputFileName, top_n)
+
