@@ -1,0 +1,161 @@
+## Spark Application - Frequent Itemsets
+
+try:
+    from pyspark import SparkConf, SparkContext
+except:
+    print
+    "No spark libraries found, ensure you are running locally."
+
+import sys
+
+# Global variables.
+preFrequentItemsets_ = []
+threshold_ = 0
+
+def main_spark(sc, outputFileAddress, threshold):
+    global preFrequentItemsets_, threshold_
+
+    threshold_ = sc.broadcast(int(threshold))
+    allFrequentItemsets = []
+    k = 1
+    # generate items and make rdd
+    items = sc.parallelize(range(1, 101)).map(lambda a: [a])
+    
+    
+    # map: calculate baskets' number which items appear in, return ([item], basket_number)
+    # filter: filter itemsets which basket_number is bigger than threshold, get candidate
+    preFrequentItemsets = items.map(calculateAppearNum)\
+       .filter(lambda a: a[1] >= threshold_.value)\
+       .map(lambda a: a[0])\
+       .collect()
+    
+    preFrequentItemsets_ = sc.broadcast(preFrequentItemsets)
+    allFrequentItemsets.append(preFrequentItemsets)
+
+   
+    # after we got k=1 frequent itemsets, we calculate k+1 automatically
+    while len(preFrequentItemsets_.value) != 0:
+        k += 1
+        newCandidateItemsets = makeLargeItemsets(k)
+        itemset = sc.parallelize(newCandidateItemsets)
+        newPreFrequentItemsets = []
+        newPreFrequentItemsets = apriori(itemset)
+        # Broadcast the global variables.
+        preFrequentItemsets_ = sc.broadcast(newPreFrequentItemsets)
+        allFrequentItemsets.append(newPreFrequentItemsets)
+    
+    # output all frequent itemsets
+    # open a file by WRITE mode, if this file doesn't exist, make a new file
+    fp = open(outputFileAddress, "wb")
+    for allItemsetsInK in allFrequentItemsets:
+        allItemsetsInK.sort()
+        for itemsets in allItemsetsInK:
+            itemsets.sort()
+            for i in range(len(itemsets)):
+                itemsets[i] = '%d'%itemsets[i]
+        for i in range(len(allItemsetsInK)):
+            allItemsetsInK[i] = " ".join(allItemsetsInK[i])
+            fp.writelines(allItemsetsInK[i])
+            fp.write("\n")
+    fp.close()
+    # print(allFrequentItemsets)
+    
+    
+    '''
+    # output maximal frequent itemsets
+    fp = open(outputFileAddress, "wb")
+    for itemsets in allFrequentItemsets[len(allFrequentItemsets)-2]:
+        itemsets.sort()
+        for i in range(len(itemsets)):
+            itemsets[i] = '%d'%itemsets[i]
+
+        outputItemsets = " ".join(itemsets)
+        fp.writelines(outputItemsets)
+        fp.write("\n")
+    fp.close()
+    '''
+    print("write successfully!")
+
+
+def calculateAppearNum(itemsetRecord):
+    # first round
+    if len(itemsetRecord) == 1:
+        itemset = itemsetRecord
+    else:
+        itemset = itemsetRecord[0]
+    current_number = itemset[0]
+    n = 1
+    count_basket = 0
+    # if one item appears in a basket, other items must appear in this basket if the <itemsets> is frequent
+    while current_number <= 100:
+        count = 0
+        for item in itemset:
+            if current_number % item == 0:
+                count += 1
+        # all item in itemset should appear in same basket together
+        if count == len(itemset):
+            count_basket += 1
+        n += 1
+        current_number = item * n
+    return (itemset, count_basket)
+
+
+def findTrueFrequent(itemset):
+    # 0 means fake frequent itemset, 1 means true frequent itemset
+    flag = 0
+    for preItemset in preFrequentItemsets_.value:
+        # itemset contains at least one preItemset means it is true frequent
+        if len(set(itemset).intersection(preItemset)) == len(preItemset):
+            flag = 1
+            break
+    return (itemset, flag)
+
+
+def makeLargeItemsets(k):
+    itemSets = preFrequentItemsets_.value
+    kItemsetsCandidate = []
+    for i in range(len(itemSets)):
+        for j in range(i+1, len(itemSets)):
+            itemSets[i].sort()
+            itemSets[j].sort()
+            # union k-1 size itemsets to make new candidate itemsets
+            count_ = -1
+            for m in range(len(itemSets[i])):
+                if itemSets[i][m] != itemSets[j][m]:
+                    break
+                count_ = m
+            if count_ >= k-3:
+                newItem = set(itemSets[i]) | set(itemSets[j])
+                kItemsetsCandidate.append(list(newItem))
+
+    return kItemsetsCandidate
+
+
+def apriori(itemset):
+    # map: judge whether the candidate is true frequent, return ([item], flag)
+    # filter: filter true frequent itemset
+    # map: calculate baskets' number which items appear in, return ([item], basket_number)
+    # filter: filter itemsets which basket_number is bigger than threshold, get candidate
+    newFrequentItemsets = itemset.map(findTrueFrequent)\
+        .filter(lambda a: a[1] == 1)\
+        .map(calculateAppearNum) \
+        .filter(lambda a: a[1] >= threshold_.value) \
+        .map(lambda a: a[0]) \
+        .collect()
+    return newFrequentItemsets
+
+
+if __name__ == "__main__":
+
+    if len(sys.argv) < 2:
+        print("Error: the number of arguments should be two, the outputAddress and the inputFile ")
+        quit()
+
+    outputFileAddress = sys.argv[1]  ## the address of the local output file to create
+    threshold = sys.argv[2]  ## the input file in HDFS
+
+    # Execute Main functionality
+    conf = SparkConf().setAppName("Frequent_Itemsets")
+    sc = SparkContext(conf=conf)
+    main_spark(sc, outputFileAddress, threshold)
+
